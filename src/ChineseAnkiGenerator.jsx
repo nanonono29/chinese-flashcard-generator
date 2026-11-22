@@ -101,6 +101,29 @@ const geminiService = {
     }
 
     return { audioData, mimeType };
+  },
+
+  /**
+   * Fetches a standard Mandarin MP3 audio file (no Gemini API call / zero Gemini quota)
+   * so Standard Mandarin TTS mode can also embed genuine playable audio files in .apkg exports.
+   */
+  async generateStandardTtsBlob({ text, lang = 'zh-CN' }) {
+    const cleanText = (text || '').trim();
+    if (!cleanText) throw new Error('No Chinese text provided for Standard TTS.');
+    const targetLang = lang && lang.toLowerCase().startsWith('zh-tw') ? 'zh-TW' : 'zh-CN';
+    const url = `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=tw-ob&tl=${encodeURIComponent(
+      targetLang
+    )}&q=${encodeURIComponent(cleanText)}`;
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Standard TTS file download failed (HTTP ${response.status}).`);
+    }
+    const blob = await response.blob();
+    if (!blob || blob.size === 0) {
+      throw new Error('Standard TTS returned an empty audio file.');
+    }
+    return { blob, ext: 'mp3' };
   }
 };
 
@@ -768,7 +791,8 @@ async function buildGenuineApkg(cardsData, deckName, audioStore) {
 
     const wordAudioBlob = audioStore[item.wordAudioKey]?.blob;
     if (wordAudioBlob) {
-      const fileName = `zh_term_${item.id}.wav`;
+      const ext = audioStore[item.wordAudioKey]?.ext || 'wav';
+      const fileName = `zh_term_${item.id}.${ext}`;
       const mediaIdxStr = String(mediaIndex++);
       mediaManifest[mediaIdxStr] = fileName;
       const arrBuf = await wordAudioBlob.arrayBuffer();
@@ -778,7 +802,8 @@ async function buildGenuineApkg(cardsData, deckName, audioStore) {
 
     const sentAudioBlob = audioStore[item.sentenceAudioKey]?.blob;
     if (sentAudioBlob) {
-      const fileName = `zh_sent_${item.id}.wav`;
+      const ext = audioStore[item.sentenceAudioKey]?.ext || 'wav';
+      const fileName = `zh_sent_${item.id}.${ext}`;
       const mediaIdxStr = String(mediaIndex++);
       mediaManifest[mediaIdxStr] = fileName;
       const arrBuf = await sentAudioBlob.arrayBuffer();
@@ -932,8 +957,12 @@ export default function App() {
   const [hskLevel, setHskLevel] = useState('');
 
   // Stage 3: Audio Store (in-memory blobs & URLs)
-  // key -> { url, blob, status: 'idle'|'loading'|'ready'|'error', textSnapshot?: string, error?: string }
+  // key -> { url, blob, ext?: 'wav'|'mp3', sourceMethod?: 'ai'|'standard', status: 'idle'|'loading'|'ready'|'error', textSnapshot?: string, error?: string }
   const [audioStore, setAudioStore] = useState({});
+  const [audioMethod, setAudioMethod] = useState('ai'); // 'ai' | 'standard'
+  const [mandarinVoices, setMandarinVoices] = useState([]);
+  const [selectedVoiceURI, setSelectedVoiceURI] = useState('');
+  const [voicesLoaded, setVoicesLoaded] = useState(false);
   const [isGeneratingTermAudio, setIsGeneratingTermAudio] = useState(false);
   const [termAudioProgress, setTermAudioProgress] = useState({ current: 0, total: 0 });
   const [isGeneratingSentenceAudio, setIsGeneratingSentenceAudio] = useState(false);
@@ -945,6 +974,93 @@ export default function App() {
   useEffect(() => {
     audioStoreRef.current = audioStore;
   }, [audioStore]);
+
+  // Detect available device Mandarin voices (zh-CN preferred, zh-TW fallback, never zh-HK or non-Chinese)
+  useEffect(() => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      setVoicesLoaded(true);
+      return;
+    }
+
+    const loadMandarinVoices = () => {
+      const allVoices = window.speechSynthesis.getVoices() || [];
+      if (allVoices.length === 0) return;
+
+      const zhCnVoices = allVoices.filter((v) => {
+        const lang = (v.lang || '').toLowerCase().replace('_', '-');
+        return lang === 'zh-cn' || lang.startsWith('zh-cn-') || lang === 'cmn-hans-cn';
+      });
+
+      const zhTwVoices = allVoices.filter((v) => {
+        const lang = (v.lang || '').toLowerCase().replace('_', '-');
+        return lang === 'zh-tw' || lang.startsWith('zh-tw-') || lang === 'cmn-hant-tw';
+      });
+
+      // Prefer zh-CN; allow zh-TW if zh-CN is unavailable; exclude zh-HK (Cantonese) and non-Chinese
+      const compatible = zhCnVoices.length > 0 ? zhCnVoices : zhTwVoices;
+      setMandarinVoices(compatible);
+      setVoicesLoaded(true);
+
+      setSelectedVoiceURI((prevUri) => {
+        if (prevUri && compatible.some((v) => v.voiceURI === prevUri)) {
+          return prevUri;
+        }
+        return compatible[0]?.voiceURI || '';
+      });
+    };
+
+    loadMandarinVoices();
+    window.speechSynthesis.addEventListener('voiceschanged', loadMandarinVoices);
+    return () => {
+      window.speechSynthesis.removeEventListener('voiceschanged', loadMandarinVoices);
+    };
+  }, []);
+
+  const selectedMandarinVoice = useMemo(() => {
+    return mandarinVoices.find((v) => v.voiceURI === selectedVoiceURI) || mandarinVoices[0] || null;
+  }, [mandarinVoices, selectedVoiceURI]);
+
+  const speakWithDeviceTts = (text, trackingKey = null) => {
+    const cleanText = (text || '').trim();
+    if (!cleanText) return;
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      setGlobalError('Standard Mandarin TTS is unavailable in this browser.');
+      return;
+    }
+    if (!selectedMandarinVoice) {
+      setGlobalError('No compatible Mandarin (zh-CN or zh-TW) voice is available on this device.');
+      return;
+    }
+
+    try {
+      window.speechSynthesis.cancel();
+      if (activeAudioRef.current) {
+        activeAudioRef.current.pause();
+        activeAudioRef.current = null;
+      }
+
+      if (trackingKey && playingKey === trackingKey) {
+        setPlayingKey(null);
+        return;
+      }
+
+      const utterance = new SpeechSynthesisUtterance(cleanText);
+      utterance.voice = selectedMandarinVoice;
+      utterance.lang = selectedMandarinVoice.lang || 'zh-CN';
+      utterance.rate = 0.95;
+
+      if (trackingKey) {
+        setPlayingKey(trackingKey);
+        utterance.onend = () => setPlayingKey(null);
+        utterance.onerror = () => setPlayingKey(null);
+      }
+
+      window.speechSynthesis.speak(utterance);
+    } catch (err) {
+      if (trackingKey) setPlayingKey(null);
+      setGlobalError(`Standard TTS playback error: ${err.message || 'Unable to speak text.'}`);
+    }
+  };
 
   // Add Term UI States (Stage A: Input Preview, Stage B: Card Review)
   const [showStageAAddModal, setShowStageAAddModal] = useState(false);
@@ -1588,9 +1704,62 @@ Return ONLY a valid JSON array matching the exact order of input items, where ev
     const normalizedText = (chineseText || '').trim();
     if (!normalizedText) return false;
 
+    if (audioMethod === 'standard') {
+      setAudioStore((prev) => ({
+        ...prev,
+        [audioKey]: {
+          ...prev[audioKey],
+          status: 'loading',
+          error: null
+        }
+      }));
+
+      try {
+        const preferredLang = selectedMandarinVoice?.lang || 'zh-CN';
+        const { blob, ext } = await geminiService.generateStandardTtsBlob({
+          text: normalizedText,
+          lang: preferredLang
+        });
+        const audioUrl = URL.createObjectURL(blob);
+
+        setAudioStore((prev) => {
+          if (prev[audioKey]?.url) {
+            URL.revokeObjectURL(prev[audioKey].url);
+          }
+          return {
+            ...prev,
+            [audioKey]: {
+              url: audioUrl,
+              blob,
+              ext,
+              sourceMethod: 'standard',
+              status: 'ready',
+              textSnapshot: normalizedText,
+              error: null
+            }
+          };
+        });
+        return true;
+      } catch (err) {
+        setAudioStore((prev) => {
+          const existing = prev[audioKey];
+          const hasFallbackAudio = Boolean(existing?.blob && existing?.url);
+          return {
+            ...prev,
+            [audioKey]: {
+              ...existing,
+              status: hasFallbackAudio ? 'ready' : 'error',
+              error: err.message || 'Standard TTS file generation failed'
+            }
+          };
+        });
+        return false;
+      }
+    }
+
     if (!geminiApiKey.trim()) {
       setGlobalError(
-        'A Gemini API key is required before generating Mandarin audio. Enter your key in the Gemini API Key bar at the top of the page.'
+        'A Gemini API key is required before generating AI Mandarin audio. Enter your key in the Gemini API Key bar or switch to Standard Mandarin TTS.'
       );
       return false;
     }
@@ -1627,6 +1796,8 @@ Return ONLY a valid JSON array matching the exact order of input items, where ev
           [audioKey]: {
             url: audioUrl,
             blob: wavBlob,
+            ext: 'wav',
+            sourceMethod: 'ai',
             status: 'ready',
             textSnapshot: normalizedText,
             error: null
@@ -1654,9 +1825,9 @@ Return ONLY a valid JSON array matching the exact order of input items, where ev
 
   const handleGenerateTermAudio = async () => {
     if (cardsData.length === 0 || isGeneratingTermAudio) return;
-    if (!geminiApiKey.trim()) {
+    if (audioMethod === 'ai' && !geminiApiKey.trim()) {
       setGlobalError(
-        'A Gemini API key is required before generating Mandarin audio. Enter your key in the Gemini API Key bar at the top of the page.'
+        'A Gemini API key is required before generating AI Mandarin audio. Enter your key in the Gemini API Key bar or switch to Standard Mandarin TTS.'
       );
       return;
     }
@@ -1686,9 +1857,9 @@ Return ONLY a valid JSON array matching the exact order of input items, where ev
 
   const handleGenerateSentenceAudio = async () => {
     if (cardsData.length === 0 || isGeneratingSentenceAudio) return;
-    if (!geminiApiKey.trim()) {
+    if (audioMethod === 'ai' && !geminiApiKey.trim()) {
       setGlobalError(
-        'A Gemini API key is required before generating Mandarin audio. Enter your key in the Gemini API Key bar at the top of the page.'
+        'A Gemini API key is required before generating AI Mandarin audio. Enter your key in the Gemini API Key bar or switch to Standard Mandarin TTS.'
       );
       return;
     }
@@ -1717,6 +1888,11 @@ Return ONLY a valid JSON array matching the exact order of input items, where ev
   };
 
   const handlePlayAudio = (audioKey, fallbackText) => {
+    if (audioMethod === 'standard') {
+      speakWithDeviceTts(fallbackText, audioKey);
+      return;
+    }
+
     const entry = audioStore[audioKey];
     if (!entry || entry.status !== 'ready' || !entry.url) {
       // Generate on demand if not yet generated
@@ -2002,7 +2178,17 @@ Return ONLY a valid JSON array matching the exact order of input items, where ev
               isStale ? 'text-amber-700 dark:text-amber-400 font-semibold' : 'text-slate-500'
             }`}
           >
-            {isLoading ? 'Gen...' : isStale ? 'Needs Regen' : isReady ? 'WAV Ready' : isError ? 'Retry' : 'Generate'}
+            {isLoading
+              ? 'Gen...'
+              : isStale
+              ? 'Needs Regen'
+              : isReady
+              ? `${(info?.ext || 'wav').toUpperCase()} Ready`
+              : isError
+              ? 'Retry'
+              : audioMethod === 'standard'
+              ? 'Speak / File'
+              : 'Generate'}
           </span>
         </button>
 
@@ -2143,12 +2329,12 @@ Return ONLY a valid JSON array matching the exact order of input items, where ev
               {geminiApiKey.trim() ? (
                 <span className="inline-flex items-center gap-1 text-emerald-700 dark:text-emerald-400 font-medium">
                   <CheckCircle2 className="w-3.5 h-3.5" />
-                  <span>Session key active (memory only — clears when tab closes)</span>
+                  <span>Session key active</span>
                 </span>
               ) : (
                 <span className="inline-flex items-center gap-1 text-amber-700 dark:text-amber-400 font-medium">
                   <AlertTriangle className="w-3.5 h-3.5" />
-                  <span>Required for card &amp; audio generation (stored in memory only)</span>
+                  <span>Required for card &amp; audio generation</span>
                 </span>
               )}
             </div>
@@ -2624,6 +2810,73 @@ Return ONLY a valid JSON array matching the exact order of input items, where ev
                           </>
                         )}
                       </button>
+                    </div>
+                  </div>
+
+                  {/* Audio Method Selector & Device Mandarin Voice Controls */}
+                  <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs">
+                    <div className="flex flex-wrap items-center gap-2.5">
+                      <label
+                        htmlFor="audio-method-select"
+                        className="font-semibold text-slate-700 dark:text-slate-300 flex items-center gap-1.5"
+                      >
+                        <Volume2 className="w-3.5 h-3.5 text-sky-600" />
+                        <span>Audio Method:</span>
+                      </label>
+                      <select
+                        id="audio-method-select"
+                        value={audioMethod}
+                        onChange={(e) => setAudioMethod(e.target.value)}
+                        className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 font-medium text-slate-900 dark:text-slate-100 focus:ring-2 focus:ring-sky-500 outline-none"
+                      >
+                        <option value="ai">AI-generated Mandarin voice</option>
+                        <option value="standard">Standard Mandarin TTS</option>
+                      </select>
+
+                      {audioMethod === 'standard' && (
+                        <>
+                          {mandarinVoices.length > 0 ? (
+                            <div className="flex flex-wrap items-center gap-2">
+                              {mandarinVoices.length > 1 ? (
+                                <select
+                                  aria-label="Select Mandarin Device Voice"
+                                  value={selectedVoiceURI}
+                                  onChange={(e) => setSelectedVoiceURI(e.target.value)}
+                                  className="px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-800 dark:text-slate-200 focus:ring-2 focus:ring-sky-500 outline-none max-w-xs"
+                                >
+                                  {mandarinVoices.map((v) => (
+                                    <option key={v.voiceURI} value={v.voiceURI}>
+                                      {v.name} ({v.lang})
+                                    </option>
+                                  ))}
+                                </select>
+                              ) : (
+                                <span className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-medium">
+                                  Voice: {selectedMandarinVoice.name} ({selectedMandarinVoice.lang})
+                                </span>
+                              )}
+
+                              <button
+                                type="button"
+                                onClick={() => speakWithDeviceTts('你好，欢迎学习中文。')}
+                                className="px-2.5 py-1.5 rounded-lg border border-sky-200 dark:border-sky-800 bg-sky-50 dark:bg-sky-950/50 hover:bg-sky-100 text-sky-700 dark:text-sky-300 font-medium transition inline-flex items-center gap-1"
+                              >
+                                <Play className="w-3 h-3" />
+                                <span>Preview Voice</span>
+                              </button>
+                            </div>
+                          ) : (
+                            voicesLoaded && (
+                              <span className="inline-flex items-center gap-1.5 text-amber-700 dark:text-amber-400 font-medium">
+                                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                                <span>
+                                  Mandarin TTS is unavailable on this device (no zh-CN or zh-TW voice detected).
+                                </span>
+                              </span>
+                            )
+                          )}
+                        </>
+                      )}
                     </div>
                   </div>
 
